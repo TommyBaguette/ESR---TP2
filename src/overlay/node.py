@@ -24,24 +24,24 @@ def get_local_ip() -> str:
 
 
 class OverlayNode:
-    def __init__(self, node_id: str, control_port: int, bootstrap_ip: str, bootstrap_port: int, initial_streams: list = None):
+    def __init__(self, node_id: str, role: str, control_port: int, bootstrap_ip: str, bootstrap_port: int, initial_streams: list = None):
         self.node_id = node_id
+        self.role = role
         self.control_port = control_port
         self.local_ip = get_local_ip()
         self.bootstrap_ip = bootstrap_ip
         self.bootstrap_port = bootstrap_port
 
         self.routing_table = RoutingTable(self.node_id)
-        self.neighbor_mgr = NeighborManager(self.node_id, self.control_port, self.routing_table)
+        self.neighbor_mgr = NeighborManager(self.node_id, self.role, self.control_port, self.routing_table)
         self.running = False
 
-        # Se este nó for um Servidor que origina streams
         if initial_streams:
             for s in initial_streams:
                 self.routing_table.register_local_stream(s)
 
     def perform_bootstrap(self):
-        print(f"[{self.node_id}] A contactar Bootstrapper em {self.bootstrap_ip}:{self.bootstrap_port}...")
+        print(f"[{self.node_id}:{self.role}] A contactar Bootstrapper em {self.bootstrap_ip}:{self.bootstrap_port}...")
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             sock.settimeout(5.0)
@@ -58,15 +58,14 @@ class OverlayNode:
 
             if reply and reply.get("type") == MSG_BOOTSTRAP_REPLY:
                 peers = reply.get("peers", [])
-                print(f"[{self.node_id}] Resposta do Bootstrap: {len(peers)} pares conhecidos.")
+                print(f"[{self.node_id}:{self.role}] Resposta do Bootstrap: {len(peers)} pares conhecidos.")
                 self.neighbor_mgr.add_known_contacts(peers)
         except Exception as e:
-            print(f"[{self.node_id}] Erro ao contactar bootstrapper: {e}")
+            print(f"[{self.node_id}:{self.role}] Erro ao contactar bootstrapper: {e}")
 
     def interactive_cli(self):
-        """Permite inspecionar a tabela e disparar subscrições manualmente pelo terminal."""
         time.sleep(1.0)
-        print(f"\n[{self.node_id}] Comandos interativos disponíveis:")
+        print(f"\n[{self.node_id}:{self.role}] Comandos disponíveis:")
         print("  routes         -> Imprime a tabela de rotas e custos")
         print("  join <stream>  -> Envia pedido JOIN_STREAM")
         print("  leave <stream> -> Envia pedido LEAVE_STREAM\n")
@@ -77,7 +76,7 @@ class OverlayNode:
                 if not cmd:
                     continue
                 if cmd[0] == "routes":
-                    print(f"--- Tabela de Rotas de {self.node_id} ---")
+                    print(f"--- Tabela de Rotas de {self.node_id} ({self.role}) ---")
                     for fid, r in self.routing_table.routes.items():
                         print(f"  Stream: {fid} | Custo: {r.cost} | Pai: {r.parent} | Filhos: {list(r.children)} | Ativo: {r.is_active}")
                     print("---------------------------------------")
@@ -96,13 +95,11 @@ class OverlayNode:
         server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         server_sock.bind(("0.0.0.0", self.control_port))
         server_sock.listen(10)
-        print(f"[{self.node_id}] Ativo no IP {self.local_ip}, porta TCP {self.control_port}...")
+        print(f"[{self.node_id}:{self.role}] Ativo no IP {self.local_ip}, porta TCP {self.control_port}...")
 
         self.perform_bootstrap()
 
-        # Inicia manutenção periódica
         threading.Thread(target=self.neighbor_mgr.heartbeat_and_maintenance_loop, daemon=True).start()
-        # Inicia interface de comandos de teste
         threading.Thread(target=self.interactive_cli, daemon=True).start()
 
         try:
@@ -114,7 +111,7 @@ class OverlayNode:
                     daemon=True
                 ).start()
         except KeyboardInterrupt:
-            print(f"\n[{self.node_id}] A encerrar...")
+            print(f"\n[{self.node_id}:{self.role}] A encerrar...")
         finally:
             self.running = False
             self.neighbor_mgr.running = False
@@ -124,14 +121,16 @@ class OverlayNode:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Nó do Serviço OTT Overlay")
     parser.add_argument("--id", required=True, help="Identificador único do nó")
+    parser.add_argument("--role", choices=["server", "node", "client"], default="node", help="Papel do nó na arquitetura")
     parser.add_argument("--port", type=int, default=5000, help="Porto TCP de controlo")
     parser.add_argument("--bootstrap-ip", required=True, help="IP do Bootstrapper")
     parser.add_argument("--bootstrap-port", type=int, default=9000, help="Porto do Bootstrapper")
-    parser.add_argument("--stream", nargs="*", default=[], help="Nomes dos streams que este nó origina (ex: S1:VIDEO_A)")
+    parser.add_argument("--stream", nargs="*", default=[], help="Nomes dos streams que este nó origina")
     args = parser.parse_args()
 
     node = OverlayNode(
         node_id=args.id,
+        role=args.role,
         control_port=args.port,
         bootstrap_ip=args.bootstrap_ip,
         bootstrap_port=args.bootstrap_port,
