@@ -1,14 +1,24 @@
 import threading
-from typing import Dict, Set, Optional, Tuple
+from typing import Dict, Set, Optional, Tuple, NamedTuple
+
+# Margem de histerese: nova rota só é adotada se for pelo menos 15% melhor
+HYSTERESIS_FACTOR = 0.85
+
+
+class RouteUpdateResult(NamedTuple):
+    route_changed: bool
+    needs_switchover: bool
+    old_parent: Optional[str]
+    new_parent: Optional[str]
 
 
 class RouteEntry:
     def __init__(self, flow_id: str, cost: float, parent: Optional[str]):
         self.flow_id = flow_id
-        self.cost = cost
-        self.parent = parent          # Nó a montante (de quem recebemos os dados)
-        self.children: Set[str] = set() # Nós a jusante que subscreveram (clientes ou outros ONodes)
-        self.is_active = False        # True apenas se a árvore estiver montada e a receber dados
+        self.cost = cost                # Custo acumulado em RTT (ms)
+        self.parent = parent            # Vizinho a montante
+        self.children: Set[str] = set() # Vizinhos a jusante subscritos
+        self.is_active = False          # True se estiver a receber dados
 
 
 class RoutingTable:
@@ -18,46 +28,46 @@ class RoutingTable:
         self.lock = threading.Lock()
 
     def register_local_stream(self, flow_id: str):
-        """Usado pelo Servidor para declarar os seus fluxos de origem com custo 0."""
         with self.lock:
             entry = RouteEntry(flow_id, cost=0.0, parent=None)
-            entry.is_active = True  # O servidor é a fonte permanente
+            entry.is_active = True
             self.routes[flow_id] = entry
 
-    def update_route(self, flow_id: str, cost_via_neighbor: float, neighbor_id: str) -> bool:
+    def update_route(self, flow_id: str, cost_via_neighbor: float, neighbor_id: str) -> RouteUpdateResult:
         """
-        Atualiza o vetor de distâncias com a métrica recebida de um vizinho.
-        Devolve True se a rota mudou (custo menor ou nova rota).
+        Avalia o vetor de distâncias com métrica de RTT e histerese.
+        Gera 'needs_switchover=True' se um fluxo ativo tiver de migrar de pai.
         """
         with self.lock:
             if flow_id not in self.routes:
                 self.routes[flow_id] = RouteEntry(flow_id, cost=cost_via_neighbor, parent=neighbor_id)
-                return True
+                return RouteUpdateResult(True, False, None, neighbor_id)
 
             current = self.routes[flow_id]
-            # Se formos a fonte local, ignoramos anúncios externos
-            if current.cost == 0.0 and current.parent is None:
-                return False
 
-            # Se o mesmo pai anuncia um novo custo, ou se encontramos um pai com menor custo
+            # Fontes de vídeo locais ignoram rotas externas
+            if current.cost == 0.0 and current.parent is None:
+                return RouteUpdateResult(False, False, None, None)
+
+            # Caso 1: Atualização vinda do pai atual
             if current.parent == neighbor_id:
-                if current.cost != cost_via_neighbor:
+                if abs(current.cost - cost_via_neighbor) > 0.5:
                     current.cost = cost_via_neighbor
-                    return True
-            elif cost_via_neighbor < current.cost:
+                    return RouteUpdateResult(True, False, None, None)
+                return RouteUpdateResult(False, False, None, None)
+
+            # Caso 2: Novo candidato a pai (aplica histerese de 15%)
+            if cost_via_neighbor < (current.cost * HYSTERESIS_FACTOR):
+                old_parent = current.parent
                 current.cost = cost_via_neighbor
                 current.parent = neighbor_id
-                return True
 
-            return False
+                needs_switch = current.is_active and (old_parent is not None)
+                return RouteUpdateResult(True, needs_switch, old_parent, neighbor_id)
+
+            return RouteUpdateResult(False, False, None, None)
 
     def add_child_to_stream(self, flow_id: str, child_id: str) -> Tuple[bool, Optional[str]]:
-        """
-        Regista um novo filho para o stream.
-        Devolve: (needs_upstream_join, parent_id)
-        - needs_upstream_join é True se este nó NÃO estava a receber o stream e precisa de pedir ao pai.
-        - needs_upstream_join é False se já estava ativo (Grafting local).
-        """
         with self.lock:
             entry = self.routes.get(flow_id)
             if not entry:
@@ -65,24 +75,16 @@ class RoutingTable:
 
             entry.children.add(child_id)
 
-            # Se for o próprio servidor de origem, não precisa de pedir nada a montante
             if entry.parent is None:
                 return False, None
 
-            # Se a rota estava inativa (ramo desligado/podado), agora tem de ser ativada
             if not entry.is_active:
                 entry.is_active = True
                 return True, entry.parent
 
-            # Se já estava ativo, o tronco é partilhado (Grafting)
             return False, entry.parent
 
     def remove_child_from_stream(self, flow_id: str, child_id: str) -> Tuple[bool, Optional[str]]:
-        """
-        Remove um filho da árvore de distribuição.
-        Devolve: (needs_upstream_prune, parent_id)
-        - needs_upstream_prune é True quando já não sobra nenhum filho e o ramo deve ser podado.
-        """
         with self.lock:
             entry = self.routes.get(flow_id)
             if not entry:
@@ -90,22 +92,16 @@ class RoutingTable:
 
             entry.children.discard(child_id)
 
-            # Se ainda existem outros filhos a assistir, continua ativo
             if len(entry.children) > 0:
                 return False, None
 
-            # Se não restam filhos e tínhamos um pai a montante:
             if entry.parent is not None and entry.is_active:
-                entry.is_active = False  # <--- REPOSIÇÃO OBRIGATÓRIA A FALSE
+                entry.is_active = False
                 return True, entry.parent
 
             return False, None
 
     def remove_neighbor(self, neighbor_id: str) -> Dict[str, Tuple[bool, Optional[str]]]:
-        """
-        Trata da queda abrupta de um vizinho (cliente ou ONode pai/filho).
-        Limpa-o como filho de todas as rotas e aciona poda se necessário.
-        """
         prune_actions = {}
         with self.lock:
             for fid, entry in list(self.routes.items()):
@@ -115,17 +111,16 @@ class RoutingTable:
                         entry.is_active = False
                         prune_actions[fid] = (True, entry.parent)
 
-                # Se o vizinho que caiu era o nosso pai, a rota fica inválida
+                # Se o pai caiu, a rota fica inacessível de imediato
                 if entry.parent == neighbor_id:
                     entry.cost = float("inf")
                     entry.is_active = False
         return prune_actions
 
     def get_exportable_routes(self) -> Dict[str, float]:
-        """Devolve o dicionário {flow_id: custo} para enviar aos vizinhos nos ROUTING_UPDATE."""
         with self.lock:
             return {
-                fid: entry.cost
+                fid: round(entry.cost, 2)
                 for fid, entry in self.routes.items()
                 if entry.cost < float("inf")
             }

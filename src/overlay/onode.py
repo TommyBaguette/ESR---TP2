@@ -24,7 +24,7 @@ def get_local_ip() -> str:
 
 
 class ONode:
-    def __init__(self, node_id: str, control_port: int, bootstrap_ip: str, bootstrap_port: int):
+    def __init__(self, node_id: str, control_port: int, bootstrap_ip: str, bootstrap_port: int, allowed_neighbors: list = None):
         self.node_id = node_id
         self.control_port = control_port
         self.data_port = control_port + 1
@@ -33,7 +33,9 @@ class ONode:
         self.bootstrap_port = bootstrap_port
 
         self.routing_table = RoutingTable(self.node_id)
-        self.neighbor_mgr = NeighborManager(self.node_id, "node", self.control_port, self.routing_table)
+        self.neighbor_mgr = NeighborManager(
+            self.node_id, "node", self.control_port, self.routing_table, allowed_neighbors
+        )
 
         self.udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.running = False
@@ -44,7 +46,7 @@ class ONode:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             sock.settimeout(4.0)
             sock.connect((self.bootstrap_ip, self.bootstrap_port))
-            
+
             send_msg(sock, {
                 "type": MSG_BOOTSTRAP_REQ,
                 "node_id": self.node_id,
@@ -62,7 +64,6 @@ class ONode:
             print(f"[{self.node_id}:ONode] Aviso: Bootstrapper inacessível ({e})")
 
     def _udp_forwarder_loop(self):
-        """Escuta datagramas de vídeo e replica-os a jusante (grafting/multicast forwarding)."""
         self.udp_sock.bind(("0.0.0.0", self.data_port))
         print(f"[{self.node_id}:ONode] Motor UDP de reencaminhamento ativo no porto {self.data_port}")
 
@@ -72,10 +73,8 @@ class ONode:
                 if len(data) < 16:
                     continue
 
-                # Os primeiros 16 bytes do cabeçalho são sempre o flow_id
                 flow_id = data[:16].decode('utf-8', errors='ignore').rstrip('\x00')
 
-                # Identificar os nós filhos subscritos
                 dest_addrs = []
                 with self.routing_table.lock:
                     entry = self.routing_table.routes.get(flow_id)
@@ -84,11 +83,9 @@ class ONode:
                             for child_id in entry.children:
                                 if child_id in self.neighbor_mgr.active_neighbors:
                                     child_ip, child_cport = self.neighbor_mgr.active_neighbors[child_id]["addr"]
-                                    # Se for cliente, o porto UDP é 5001 (ou control_port + 1)
                                     child_dport = 5001 if child_cport == 0 else child_cport + 1
                                     dest_addrs.append((child_ip, child_dport))
 
-                # Replicação / Bifurcação rápida em espaço de utilizador
                 for addr in dest_addrs:
                     try:
                         self.udp_sock.sendto(data, addr)
@@ -113,13 +110,13 @@ class ONode:
                     print(f"--- Rotas Overlay de {self.node_id} ---")
                     with self.routing_table.lock:
                         for fid, r in self.routing_table.routes.items():
-                            print(f"  Stream: {fid} | Custo: {r.cost} | Pai: {r.parent} | Filhos: {list(r.children)} | Ativo: {r.is_active}")
+                            print(f"  Stream: {fid} | Custo RTT: {r.cost:.2f}ms | Pai: {r.parent} | Filhos: {list(r.children)} | Ativo: {r.is_active}")
                     print("---------------------------------------")
                 elif cmd[0] == "peers":
                     print(f"--- Vizinhos Ativos de {self.node_id} ---")
                     with self.neighbor_mgr.lock:
                         for pid, info in self.neighbor_mgr.active_neighbors.items():
-                            print(f"  {pid} -> {info['addr']} (Papel: {info.get('role')})")
+                            print(f"  {pid} -> {info['addr']} (RTT: {info['rtt']:.2f}ms, Papel: {info.get('role')})")
                     print("---------------------------------------")
             except (EOFError, KeyboardInterrupt):
                 break
@@ -136,7 +133,6 @@ class ONode:
 
         self.perform_bootstrap()
 
-        # Iniciar forwarding UDP, manutenção de vizinhos e consola
         threading.Thread(target=self._udp_forwarder_loop, daemon=True).start()
         threading.Thread(target=self.neighbor_mgr.heartbeat_and_maintenance_loop, daemon=True).start()
         threading.Thread(target=self.interactive_cli, daemon=True).start()
@@ -164,7 +160,8 @@ if __name__ == "__main__":
     parser.add_argument("--port", type=int, default=5000, help="Porto TCP de controlo")
     parser.add_argument("--bootstrap-ip", required=True, help="IP do Bootstrapper")
     parser.add_argument("--bootstrap-port", type=int, default=9000, help="Porto do Bootstrapper")
+    parser.add_argument("--neighbors", nargs="+", default=None, help="Lista de nós autorizados como vizinhos diretos (ex: --neighbors O1 O2)")
     args = parser.parse_args()
 
-    onode = ONode(args.id, args.port, args.bootstrap_ip, args.bootstrap_port)
+    onode = ONode(args.id, args.port, args.bootstrap_ip, args.bootstrap_port, args.neighbors)
     onode.start()
