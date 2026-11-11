@@ -23,28 +23,24 @@ def get_local_ip() -> str:
     return ip
 
 
-class OverlayNode:
-    def __init__(self, node_id: str, role: str, control_port: int, bootstrap_ip: str, bootstrap_port: int, initial_streams: list = None):
+class ONode:
+    def __init__(self, node_id: str, control_port: int, bootstrap_ip: str, bootstrap_port: int):
         self.node_id = node_id
-        self.role = role
         self.control_port = control_port
         self.local_ip = get_local_ip()
         self.bootstrap_ip = bootstrap_ip
         self.bootstrap_port = bootstrap_port
 
         self.routing_table = RoutingTable(self.node_id)
-        self.neighbor_mgr = NeighborManager(self.node_id, self.role, self.control_port, self.routing_table)
+        # ONode usa o papel "node", permitindo conetividade com servidores e outros ONodes
+        self.neighbor_mgr = NeighborManager(self.node_id, "node", self.control_port, self.routing_table)
         self.running = False
 
-        if initial_streams:
-            for s in initial_streams:
-                self.routing_table.register_local_stream(s)
-
     def perform_bootstrap(self):
-        print(f"[{self.node_id}:{self.role}] A contactar Bootstrapper em {self.bootstrap_ip}:{self.bootstrap_port}...")
+        print(f"[{self.node_id}:ONode] A registar no Bootstrapper ({self.bootstrap_ip}:{self.bootstrap_port})...")
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(5.0)
+            sock.settimeout(4.0)
             sock.connect((self.bootstrap_ip, self.bootstrap_port))
             
             send_msg(sock, {
@@ -58,17 +54,16 @@ class OverlayNode:
 
             if reply and reply.get("type") == MSG_BOOTSTRAP_REPLY:
                 peers = reply.get("peers", [])
-                print(f"[{self.node_id}:{self.role}] Resposta do Bootstrap: {len(peers)} pares conhecidos.")
+                print(f"[{self.node_id}:ONode] Contactos recebidos do Bootstrap: {len(peers)}")
                 self.neighbor_mgr.add_known_contacts(peers)
         except Exception as e:
-            print(f"[{self.node_id}:{self.role}] Erro ao contactar bootstrapper: {e}")
+            print(f"[{self.node_id}:ONode] Aviso: Não foi possível contactar bootstrapper ({e})")
 
     def interactive_cli(self):
         time.sleep(1.0)
-        print(f"\n[{self.node_id}:{self.role}] Comandos disponíveis:")
-        print("  routes         -> Imprime a tabela de rotas e custos")
-        print("  join <stream>  -> Envia pedido JOIN_STREAM")
-        print("  leave <stream> -> Envia pedido LEAVE_STREAM\n")
+        print(f"\n[{self.node_id}:ONode] Consola pronta:")
+        print("  routes   -> Ver tabela de rotas e árvores ativas")
+        print("  peers    -> Listar vizinhos TCP ativos\n")
 
         while self.running:
             try:
@@ -76,14 +71,17 @@ class OverlayNode:
                 if not cmd:
                     continue
                 if cmd[0] == "routes":
-                    print(f"--- Tabela de Rotas de {self.node_id} ({self.role}) ---")
-                    for fid, r in self.routing_table.routes.items():
-                        print(f"  Stream: {fid} | Custo: {r.cost} | Pai: {r.parent} | Filhos: {list(r.children)} | Ativo: {r.is_active}")
+                    print(f"--- Rotas Overlay de {self.node_id} ---")
+                    with self.routing_table.lock:
+                        for fid, r in self.routing_table.routes.items():
+                            print(f"  Stream: {fid} | Custo: {r.cost} | Pai: {r.parent} | Filhos: {list(r.children)} | Ativo: {r.is_active}")
                     print("---------------------------------------")
-                elif cmd[0] == "join" and len(cmd) > 1:
-                    self.neighbor_mgr.send_join(cmd[1])
-                elif cmd[0] == "leave" and len(cmd) > 1:
-                    self.neighbor_mgr.send_leave(cmd[1])
+                elif cmd[0] == "peers":
+                    print(f"--- Vizinhos Ativos de {self.node_id} ---")
+                    with self.neighbor_mgr.lock:
+                        for pid, info in self.neighbor_mgr.active_neighbors.items():
+                            print(f"  {pid} -> {info['addr']} (Papel: {info.get('role')})")
+                    print("---------------------------------------")
             except (EOFError, KeyboardInterrupt):
                 break
 
@@ -95,7 +93,7 @@ class OverlayNode:
         server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         server_sock.bind(("0.0.0.0", self.control_port))
         server_sock.listen(10)
-        print(f"[{self.node_id}:{self.role}] Ativo no IP {self.local_ip}, porta TCP {self.control_port}...")
+        print(f"[{self.node_id}:ONode] Escuta de controlo no IP {self.local_ip}:{self.control_port}")
 
         self.perform_bootstrap()
 
@@ -111,7 +109,7 @@ class OverlayNode:
                     daemon=True
                 ).start()
         except KeyboardInterrupt:
-            print(f"\n[{self.node_id}:{self.role}] A encerrar...")
+            print(f"\n[{self.node_id}:ONode] A terminar...")
         finally:
             self.running = False
             self.neighbor_mgr.running = False
@@ -119,21 +117,12 @@ class OverlayNode:
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Nó do Serviço OTT Overlay")
-    parser.add_argument("--id", required=True, help="Identificador único do nó")
-    parser.add_argument("--role", choices=["server", "node", "client"], default="node", help="Papel do nó na arquitetura")
+    parser = argparse.ArgumentParser(description="Nó de Encaminhamento Overlay (ONode)")
+    parser.add_argument("--id", required=True, help="Identificador único (ex: O1, O2)")
     parser.add_argument("--port", type=int, default=5000, help="Porto TCP de controlo")
     parser.add_argument("--bootstrap-ip", required=True, help="IP do Bootstrapper")
     parser.add_argument("--bootstrap-port", type=int, default=9000, help="Porto do Bootstrapper")
-    parser.add_argument("--stream", nargs="*", default=[], help="Nomes dos streams que este nó origina")
     args = parser.parse_args()
 
-    node = OverlayNode(
-        node_id=args.id,
-        role=args.role,
-        control_port=args.port,
-        bootstrap_ip=args.bootstrap_ip,
-        bootstrap_port=args.bootstrap_port,
-        initial_streams=args.stream
-    )
-    node.start()
+    onode = ONode(args.id, args.port, args.bootstrap_ip, args.bootstrap_port)
+    onode.start()
