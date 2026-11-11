@@ -27,13 +27,15 @@ class ONode:
     def __init__(self, node_id: str, control_port: int, bootstrap_ip: str, bootstrap_port: int):
         self.node_id = node_id
         self.control_port = control_port
+        self.data_port = control_port + 1
         self.local_ip = get_local_ip()
         self.bootstrap_ip = bootstrap_ip
         self.bootstrap_port = bootstrap_port
 
         self.routing_table = RoutingTable(self.node_id)
-        # ONode usa o papel "node", permitindo conetividade com servidores e outros ONodes
         self.neighbor_mgr = NeighborManager(self.node_id, "node", self.control_port, self.routing_table)
+
+        self.udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.running = False
 
     def perform_bootstrap(self):
@@ -54,10 +56,47 @@ class ONode:
 
             if reply and reply.get("type") == MSG_BOOTSTRAP_REPLY:
                 peers = reply.get("peers", [])
-                print(f"[{self.node_id}:ONode] Contactos recebidos do Bootstrap: {len(peers)}")
+                print(f"[{self.node_id}:ONode] Contactos obtidos do Bootstrap: {len(peers)}")
                 self.neighbor_mgr.add_known_contacts(peers)
         except Exception as e:
-            print(f"[{self.node_id}:ONode] Aviso: Não foi possível contactar bootstrapper ({e})")
+            print(f"[{self.node_id}:ONode] Aviso: Bootstrapper inacessível ({e})")
+
+    def _udp_forwarder_loop(self):
+        """Escuta datagramas de vídeo e replica-os a jusante (grafting/multicast forwarding)."""
+        self.udp_sock.bind(("0.0.0.0", self.data_port))
+        print(f"[{self.node_id}:ONode] Motor UDP de reencaminhamento ativo no porto {self.data_port}")
+
+        while self.running:
+            try:
+                data, _ = self.udp_sock.recvfrom(65535)
+                if len(data) < 16:
+                    continue
+
+                # Os primeiros 16 bytes do cabeçalho são sempre o flow_id
+                flow_id = data[:16].decode('utf-8', errors='ignore').rstrip('\x00')
+
+                # Identificar os nós filhos subscritos
+                dest_addrs = []
+                with self.routing_table.lock:
+                    entry = self.routing_table.routes.get(flow_id)
+                    if entry and entry.children:
+                        with self.neighbor_mgr.lock:
+                            for child_id in entry.children:
+                                if child_id in self.neighbor_mgr.active_neighbors:
+                                    child_ip, child_cport = self.neighbor_mgr.active_neighbors[child_id]["addr"]
+                                    # Se for cliente, o porto UDP é 5001 (ou control_port + 1)
+                                    child_dport = 5001 if child_cport == 0 else child_cport + 1
+                                    dest_addrs.append((child_ip, child_dport))
+
+                # Replicação / Bifurcação rápida em espaço de utilizador
+                for addr in dest_addrs:
+                    try:
+                        self.udp_sock.sendto(data, addr)
+                    except Exception:
+                        pass
+
+            except Exception:
+                break
 
     def interactive_cli(self):
         time.sleep(1.0)
@@ -93,10 +132,12 @@ class ONode:
         server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         server_sock.bind(("0.0.0.0", self.control_port))
         server_sock.listen(10)
-        print(f"[{self.node_id}:ONode] Escuta de controlo no IP {self.local_ip}:{self.control_port}")
+        print(f"[{self.node_id}:ONode] Controlo TCP em {self.local_ip}:{self.control_port}")
 
         self.perform_bootstrap()
 
+        # Iniciar forwarding UDP, manutenção de vizinhos e consola
+        threading.Thread(target=self._udp_forwarder_loop, daemon=True).start()
         threading.Thread(target=self.neighbor_mgr.heartbeat_and_maintenance_loop, daemon=True).start()
         threading.Thread(target=self.interactive_cli, daemon=True).start()
 
@@ -114,11 +155,12 @@ class ONode:
             self.running = False
             self.neighbor_mgr.running = False
             server_sock.close()
+            self.udp_sock.close()
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Nó de Encaminhamento Overlay (ONode)")
-    parser.add_argument("--id", required=True, help="Identificador único (ex: O1, O2)")
+    parser = argparse.ArgumentParser(description="Nó de Trânsito Overlay (ONode)")
+    parser.add_argument("--id", required=True, help="Identificador único (ex: O1)")
     parser.add_argument("--port", type=int, default=5000, help="Porto TCP de controlo")
     parser.add_argument("--bootstrap-ip", required=True, help="IP do Bootstrapper")
     parser.add_argument("--bootstrap-port", type=int, default=9000, help="Porto do Bootstrapper")

@@ -1,144 +1,131 @@
 import threading
-import time
 from typing import Dict, Set, Optional, Tuple
 
+
 class RouteEntry:
-    def __init__(self, flow_id: str, cost: int, parent: Optional[str] = None):
+    def __init__(self, flow_id: str, cost: float, parent: Optional[str]):
         self.flow_id = flow_id
         self.cost = cost
-        self.parent = parent
-        self.children: Set[str] = set()       # Vizinhos a jusante subscritos
-        self.is_active = False                # Se o fluxo está ativo nesta árvore
-        self.last_updated = time.time()
+        self.parent = parent          # Nó a montante (de quem recebemos os dados)
+        self.children: Set[str] = set() # Nós a jusante que subscreveram (clientes ou outros ONodes)
+        self.is_active = False        # True apenas se a árvore estiver montada e a receber dados
 
 
 class RoutingTable:
-    def __init__(self, node_id: str):
-        self.node_id = node_id
-        # {flow_id: RouteEntry}
+    def __init__(self, my_id: str):
+        self.my_id = my_id
         self.routes: Dict[str, RouteEntry] = {}
-        # Streams originados localmente caso o nó seja Servidor: {flow_id: cost 0}
-        self.local_streams: Set[str] = set()
         self.lock = threading.Lock()
 
     def register_local_stream(self, flow_id: str):
-        """Regista um vídeo originado neste nó (ex: Servidor S1 com custo 0)."""
+        """Usado pelo Servidor para declarar os seus fluxos de origem com custo 0."""
         with self.lock:
-            self.local_streams.add(flow_id)
-            entry = RouteEntry(flow_id=flow_id, cost=0, parent=None)
-            entry.is_active = True
+            entry = RouteEntry(flow_id, cost=0.0, parent=None)
+            entry.is_active = True  # O servidor é a fonte permanente
             self.routes[flow_id] = entry
-            print(f"[{self.node_id}] Stream local registado: {flow_id} (Custo 0)")
 
-    def update_route_from_neighbor(self, neighbor_id: str, flow_id: str, advertised_cost: int, link_cost: int = 1) -> bool:
+    def update_route(self, flow_id: str, cost_via_neighbor: float, neighbor_id: str) -> bool:
         """
-        Recebe a rota anunciada por um vizinho direto.
-        Calcula: novo_custo = advertised_cost + link_cost.
-        Retorna True se a nossa tabela de rotas melhorou/alterou (para disparar update).
-        """
-        if flow_id in self.local_streams:
-            return False  # Nós somos a fonte original deste stream
-
-        total_cost = advertised_cost + link_cost
-        changed = False
-
-        with self.lock:
-            if flow_id not in self.routes:
-                # Nova rota descoberta
-                self.routes[flow_id] = RouteEntry(flow_id=flow_id, cost=total_cost, parent=neighbor_id)
-                changed = True
-                print(f"[{self.node_id}] [ROTA NOVA] Stream {flow_id} via {neighbor_id} (Custo: {total_cost})")
-            else:
-                current = self.routes[flow_id]
-                # Se vier do mesmo pai e o custo mudou, atualiza
-                if current.parent == neighbor_id:
-                    if current.cost != total_cost:
-                        current.cost = total_cost
-                        current.last_updated = time.time()
-                        changed = True
-                # Se for por outro vizinho e o custo for estritamente menor, comuta o pai
-                elif total_cost < current.cost:
-                    print(f"[{self.node_id}] [MELHOR ROTA] Stream {flow_id} comuta de {current.parent} para {neighbor_id} ({current.cost} -> {total_cost})")
-                    current.parent = neighbor_id
-                    current.cost = total_cost
-                    current.last_updated = time.time()
-                    changed = True
-
-        return changed
-
-    def handle_neighbor_down(self, failed_neighbor: str) -> Set[str]:
-        """
-        Quando um vizinho cai, invalida as rotas que dependiam dele como parent
-        e remove-o de quaisquer listas de children.
-        Devolve o conjunto de flow_ids afetados para os quais é preciso procurar alternativa.
-        """
-        affected_flows = set()
-        with self.lock:
-            for flow_id, entry in list(self.routes.items()):
-                # Se o nó caído era o nosso consumidor (filho), remove-o
-                entry.children.discard(failed_neighbor)
-
-                # Se o nó caído era a nossa fonte (pai)
-                if entry.parent == failed_neighbor and flow_id not in self.local_streams:
-                    entry.parent = None
-                    entry.cost = float('inf')
-                    entry.is_active = False
-                    affected_flows.add(flow_id)
-                    print(f"[{self.node_id}] [ROTA PERDIDA] Pai {failed_neighbor} caiu para {flow_id}. Rota invalidada.")
-
-        return affected_flows
-
-    def add_child(self, flow_id: str, child_id: str) -> Tuple[bool, Optional[str]]:
-        """
-        Processa um JOIN_STREAM recebido:
-        - Regista o child_id.
-        - Devolve (need_upstream_join, parent_id).
-        Se need_upstream_join for False, foi feito GRAFTING num ramo já ativo!
+        Atualiza o vetor de distâncias com a métrica recebida de um vizinho.
+        Devolve True se a rota mudou (custo menor ou nova rota).
         """
         with self.lock:
             if flow_id not in self.routes:
+                self.routes[flow_id] = RouteEntry(flow_id, cost=cost_via_neighbor, parent=neighbor_id)
+                return True
+
+            current = self.routes[flow_id]
+            # Se formos a fonte local, ignoramos anúncios externos
+            if current.cost == 0.0 and current.parent is None:
+                return False
+
+            # Se o mesmo pai anuncia um novo custo, ou se encontramos um pai com menor custo
+            if current.parent == neighbor_id:
+                if current.cost != cost_via_neighbor:
+                    current.cost = cost_via_neighbor
+                    return True
+            elif cost_via_neighbor < current.cost:
+                current.cost = cost_via_neighbor
+                current.parent = neighbor_id
+                return True
+
+            return False
+
+    def add_child_to_stream(self, flow_id: str, child_id: str) -> Tuple[bool, Optional[str]]:
+        """
+        Regista um novo filho para o stream.
+        Devolve: (needs_upstream_join, parent_id)
+        - needs_upstream_join é True se este nó NÃO estava a receber o stream e precisa de pedir ao pai.
+        - needs_upstream_join é False se já estava ativo (Grafting local).
+        """
+        with self.lock:
+            entry = self.routes.get(flow_id)
+            if not entry:
                 return False, None
 
-            entry = self.routes[flow_id]
             entry.children.add(child_id)
-            print(f"[{self.node_id}] [MULTICAST] Filho {child_id} adicionado ao fluxo {flow_id}. Total filhos: {len(entry.children)}")
 
+            # Se for o próprio servidor de origem, não precisa de pedir nada a montante
+            if entry.parent is None:
+                return False, None
+
+            # Se a rota estava inativa (ramo desligado/podado), agora tem de ser ativada
             if not entry.is_active:
-                # Este nó ainda não recebia o fluxo; precisa de pedir ao seu próprio pai
                 entry.is_active = True
                 return True, entry.parent
-            else:
-                # GRAFTING: este nó já recebe o fluxo; o JOIN para aqui!
-                print(f"[{self.node_id}] [GRAFTING] Tronco partilhado para {flow_id}. Ramo ativado sem novo pedido a montante.")
-                return False, entry.parent
 
-    def remove_child(self, flow_id: str, child_id: str) -> Tuple[bool, Optional[str]]:
+            # Se já estava ativo, o tronco é partilhado (Grafting)
+            return False, entry.parent
+
+    def remove_child_from_stream(self, flow_id: str, child_id: str) -> Tuple[bool, Optional[str]]:
         """
-        Processa um LEAVE_STREAM:
-        Remove o filho. Se não restarem mais filhos e o nó não for consumidor local,
-        desativa o ramo (PRUNING) e devolve (need_upstream_prune, parent_id).
+        Remove um filho da árvore de distribuição.
+        Devolve: (needs_upstream_prune, parent_id)
+        - needs_upstream_prune é True quando já não sobra nenhum filho e o ramo deve ser podado.
         """
         with self.lock:
-            if flow_id not in self.routes:
+            entry = self.routes.get(flow_id)
+            if not entry:
                 return False, None
 
-            entry = self.routes[flow_id]
             entry.children.discard(child_id)
-            print(f"[{self.node_id}] [MULTICAST] Filho {child_id} removido de {flow_id}. Restantes: {len(entry.children)}")
 
-            # Se não há mais filhos e não somos a origem, podamos o ramo
-            if len(entry.children) == 0 and flow_id not in self.local_streams:
-                entry.is_active = False
-                print(f"[{self.node_id}] [PRUNING] Sem mais filhos para {flow_id}. Ramo desativado.")
+            # Se ainda existem outros filhos a assistir, continua ativo
+            if len(entry.children) > 0:
+                return False, None
+
+            # Se não restam filhos e tínhamos um pai a montante:
+            if entry.parent is not None and entry.is_active:
+                entry.is_active = False  # <--- REPOSIÇÃO OBRIGATÓRIA A FALSE
                 return True, entry.parent
 
             return False, None
 
-    def get_exportable_routes(self) -> Dict[str, int]:
-        """Devolve um dicionário {flow_id: custo} para partilhar com os vizinhos diretos."""
+    def remove_neighbor(self, neighbor_id: str) -> Dict[str, Tuple[bool, Optional[str]]]:
+        """
+        Trata da queda abrupta de um vizinho (cliente ou ONode pai/filho).
+        Limpa-o como filho de todas as rotas e aciona poda se necessário.
+        """
+        prune_actions = {}
+        with self.lock:
+            for fid, entry in list(self.routes.items()):
+                if neighbor_id in entry.children:
+                    entry.children.discard(neighbor_id)
+                    if len(entry.children) == 0 and entry.parent is not None and entry.is_active:
+                        entry.is_active = False
+                        prune_actions[fid] = (True, entry.parent)
+
+                # Se o vizinho que caiu era o nosso pai, a rota fica inválida
+                if entry.parent == neighbor_id:
+                    entry.cost = float("inf")
+                    entry.is_active = False
+        return prune_actions
+
+    def get_exportable_routes(self) -> Dict[str, float]:
+        """Devolve o dicionário {flow_id: custo} para enviar aos vizinhos nos ROUTING_UPDATE."""
         with self.lock:
             return {
-                flow_id: entry.cost
-                for flow_id, entry in self.routes.items()
-                if entry.cost != float('inf')
+                fid: entry.cost
+                for fid, entry in self.routes.items()
+                if entry.cost < float("inf")
             }

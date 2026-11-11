@@ -1,123 +1,53 @@
 import socket
 import threading
 import time
-from typing import Dict, List, Tuple
+import sys
+import os
+from typing import Dict, Tuple, Optional
+
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
 from src.common.protocol import (
     send_msg, recv_msg,
-    MSG_HELLO, MSG_HELLO_ACK, MSG_HELLO_REJECT, MSG_PEER_SUGGEST,
+    MSG_HELLO, MSG_HELLO_ACK, MSG_HELLO_REJECT,
     MSG_PING, MSG_PONG,
-    MSG_ROUTING_UPDATE, MSG_JOIN_STREAM, MSG_JOIN_ACK, MSG_LEAVE_STREAM
+    MSG_ROUTING_UPDATE,
+    MSG_JOIN_STREAM, MSG_JOIN_ACK, MSG_LEAVE_STREAM
 )
 from src.overlay.routing import RoutingTable
 
 
 class NeighborManager:
-    def __init__(self, node_id: str, role: str, control_port: int, routing_table: RoutingTable, target_peers: int = 3, max_peers: int = 5):
+    def __init__(self, node_id: str, role: str, control_port: int, routing_table: RoutingTable):
         self.node_id = node_id
-        self.role = role  # "server", "node" ou "client"
+        self.role = role  # "node" ou "server"
         self.control_port = control_port
         self.routing_table = routing_table
-        self.target_peers = 1 if role == "client" else target_peers
-        self.max_peers = 1 if role == "client" else max_peers
 
+        # {peer_id: {"sock": socket, "addr": (ip, port), "role": str, "rtt": float, "last_seen": float}}
         self.active_neighbors: Dict[str, dict] = {}
-        self.known_contacts: Dict[str, Tuple[str, int]] = {}
-        
+        # Conexões ativas por socket para multiplexação
+        self.sockets_map: Dict[socket.socket, str] = {}
         self.lock = threading.Lock()
+        
         self.running = False
+        self.ping_timestamps: Dict[str, float] = {}
 
-    def is_peer_allowed(self, remote_role: str) -> bool:
-        """Regras de admissão de topologia:
-        - client só aceita node (nunca liga a server nem a outro client)
-        - server só aceita node (nunca liga a client nem a outro server)
-        - node aceita toda a gente (server, node, client)
-        """
-        if self.role == "client":
-            return remote_role == "node"
-        if self.role == "server":
-            return remote_role == "node"
-        if self.role == "node":
-            return True
-        return False
-
-    def add_known_contacts(self, peers_list: List[list]):
-        with self.lock:
-            for peer in peers_list:
-                p_id, p_ip, p_port = peer[0], peer[1], int(peer[2])
-                if p_id != self.node_id and p_id not in self.active_neighbors:
-                    self.known_contacts[p_id] = (p_ip, p_port)
-
-    def handle_incoming_connection(self, sock: socket.socket, addr: Tuple[str, int]):
-        try:
-            msg = recv_msg(sock)
-            if not msg or msg.get("type") != MSG_HELLO:
-                sock.close()
-                return
-
-            peer_id = msg.get("node_id")
-            peer_role = msg.get("role", "node")
-            peer_port = msg.get("control_port")
-
+    def add_known_contacts(self, peers: list):
+        """Tenta ligar-se aos nós conhecidos devolvidos pelo Bootstrapper."""
+        for peer in peers:
+            peer_id, ip, port = peer[0], peer[1], peer[2]
             if peer_id == self.node_id:
-                sock.close()
-                return
-
-            # Validação de Papel
-            if not self.is_peer_allowed(peer_role):
-                send_msg(sock, {
-                    "type": MSG_HELLO_REJECT,
-                    "reason": f"Incompatibilidade de papéis ({self.role} não admite {peer_role})"
-                })
-                sock.close()
-                return
-
+                continue
             with self.lock:
                 if peer_id in self.active_neighbors:
-                    sock.close()
-                    return
+                    continue
+            threading.Thread(target=self._connect_to_peer, args=(peer_id, ip, port), daemon=True).start()
 
-                if len(self.active_neighbors) >= self.max_peers:
-                    suggested = [[pid, ip, port] for pid, (ip, port) in self.known_contacts.items() if pid != peer_id]
-                    send_msg(sock, {
-                        "type": MSG_PEER_SUGGEST,
-                        "suggested_peers": suggested
-                    })
-                    sock.close()
-                    return
-
-                self.active_neighbors[peer_id] = {
-                    "sock": sock,
-                    "addr": (addr[0], peer_port),
-                    "role": peer_role,
-                    "last_seen": time.time()
-                }
-                self.known_contacts.pop(peer_id, None)
-
-            send_msg(sock, {
-                "type": MSG_HELLO_ACK,
-                "node_id": self.node_id,
-                "role": self.role,
-                "status": "ACCEPTED"
-            })
-            print(f"[{self.node_id}:{self.role}] Vizinhança estabelecida com {peer_id} ({peer_role} em {addr[0]}:{peer_port}).")
-
-            self.send_routing_update_to(peer_id)
-            threading.Thread(target=self._listen_neighbor, args=(peer_id, sock), daemon=True).start()
-
-        except Exception:
-            sock.close()
-
-    def connect_to_peer(self, peer_id: str, ip: str, port: int) -> bool:
-        if peer_id == self.node_id:
-            return False
-
-        with self.lock:
-            if len(self.active_neighbors) >= self.max_peers or peer_id in self.active_neighbors:
-                return False
-
+    def _connect_to_peer(self, peer_id: str, ip: str, port: int):
+        """Estabelece ligação de controlo TCP a montante/horizontal."""
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(3.0)
+            sock.settimeout(4.0)
             sock.connect((ip, port))
             sock.settimeout(None)
 
@@ -129,230 +59,240 @@ class NeighborManager:
             })
 
             reply = recv_msg(sock)
-            if not reply:
-                sock.close()
-                return False
-
-            if reply.get("type") == MSG_HELLO_ACK:
+            if reply and reply.get("type") == MSG_HELLO_ACK:
                 peer_role = reply.get("role", "node")
-                # Confirma se o nó remoto também é aceitável para nós
-                if not self.is_peer_allowed(peer_role):
-                    sock.close()
-                    return False
-
-                with self.lock:
-                    self.active_neighbors[peer_id] = {
-                        "sock": sock,
-                        "addr": (ip, port),
-                        "role": peer_role,
-                        "last_seen": time.time()
-                    }
-                    self.known_contacts.pop(peer_id, None)
-
-                print(f"[{self.node_id}:{self.role}] Ligação aceite ao vizinho {peer_id} ({peer_role} em {ip}:{port}).")
-                self.send_routing_update_to(peer_id)
-                threading.Thread(target=self._listen_neighbor, args=(peer_id, sock), daemon=True).start()
-                return True
-
-            elif reply.get("type") == MSG_HELLO_REJECT:
-                # O nó remoto rejeitou-nos legitimamente por política de papel
+                self._register_neighbor(peer_id, sock, (ip, port), peer_role)
+                print(f"[{self.node_id}:{self.role}] Vizinhança estabelecida com {peer_id} ({peer_role} em {ip}:{port}).")
+                
+                # Envia de imediato a nossa tabela de rotas local
+                self._send_routing_update_to(peer_id)
+                self._listen_to_peer(sock, peer_id)
+            else:
                 sock.close()
-                return False
+        except Exception:
+            pass
 
-            elif reply.get("type") == MSG_PEER_SUGGEST:
-                self.add_known_contacts(reply.get("suggested_peers", []))
-                sock.close()
-                return False
+    def handle_incoming_connection(self, client_sock: socket.socket, addr: Tuple[str, int]):
+        """Processa pedidos de ligação TCP recebidos."""
+        try:
+            client_sock.settimeout(5.0)
+            msg = recv_msg(client_sock)
+            client_sock.settimeout(None)
+
+            if not msg or msg.get("type") != MSG_HELLO:
+                client_sock.close()
+                return
+
+            peer_id = msg.get("node_id")
+            peer_role = msg.get("role", "node")
+            peer_cport = msg.get("control_port", 0)
+
+            # Regra de isolamento: Servidor nunca atende clientes finais diretamente
+            if self.role == "server" and peer_role == "client":
+                send_msg(client_sock, {
+                    "type": MSG_HELLO_REJECT,
+                    "reason": "Servidores apenas atendem nós de infraestrutura (ONodes)."
+                })
+                client_sock.close()
+                return
+
+            send_msg(client_sock, {
+                "type": MSG_HELLO_ACK,
+                "node_id": self.node_id,
+                "role": self.role
+            })
+
+            peer_effective_addr = (addr[0], peer_cport)
+            self._register_neighbor(peer_id, client_sock, peer_effective_addr, peer_role)
+            print(f"[{self.node_id}:{self.role}] Vizinhança aceite com {peer_id} ({peer_role} em {addr[0]}:{peer_cport}).")
+
+            # Partilha de imediato os canais conhecidos
+            self._send_routing_update_to(peer_id)
+            self._listen_to_peer(client_sock, peer_id)
 
         except Exception:
-            return False
+            client_sock.close()
 
-        return False
-
-    def send_routing_update_to(self, peer_id: str):
-        routes = self.routing_table.get_exportable_routes()
-        if not routes:
-            return
+    def _register_neighbor(self, peer_id: str, sock: socket.socket, addr: Tuple[str, int], peer_role: str):
         with self.lock:
-            if peer_id in self.active_neighbors:
-                try:
-                    send_msg(self.active_neighbors[peer_id]["sock"], {
-                        "type": MSG_ROUTING_UPDATE,
-                        "sender_id": self.node_id,
-                        "routes": routes
-                    })
-                except Exception:
-                    pass
+            self.active_neighbors[peer_id] = {
+                "sock": sock,
+                "addr": addr,
+                "role": peer_role,
+                "rtt": 1.0,
+                "last_seen": time.time()
+            }
+            self.sockets_map[sock] = peer_id
 
-    def broadcast_routing_update(self):
-        routes = self.routing_table.get_exportable_routes()
-        if not routes:
-            return
-        with self.lock:
-            for peer_id, info in list(self.active_neighbors.items()):
-                try:
-                    send_msg(info["sock"], {
-                        "type": MSG_ROUTING_UPDATE,
-                        "sender_id": self.node_id,
-                        "routes": routes
-                    })
-                except Exception:
-                    pass
-
-    def send_join(self, flow_id: str) -> bool:
-        with self.routing_table.lock:
-            entry = self.routing_table.routes.get(flow_id)
-            if not entry or not entry.parent:
-                print(f"[{self.node_id}] Erro: Não há rota conhecida para {flow_id}.")
-                return False
-            parent_id = entry.parent
-
-        print(f"[{self.node_id}] A enviar JOIN_STREAM de {flow_id} para o pai {parent_id}...")
-        return self._send_control_msg(parent_id, {
-            "type": MSG_JOIN_STREAM,
-            "flow_id": flow_id,
-            "requester_id": self.node_id
-        })
-
-    def send_leave(self, flow_id: str) -> bool:
-        with self.routing_table.lock:
-            entry = self.routing_table.routes.get(flow_id)
-            if not entry or not entry.parent:
-                return False
-            parent_id = entry.parent
-
-        return self._send_control_msg(parent_id, {
-            "type": MSG_LEAVE_STREAM,
-            "flow_id": flow_id,
-            "requester_id": self.node_id
-        })
-
-    def _send_control_msg(self, target_id: str, msg: dict) -> bool:
-        with self.lock:
-            if target_id in self.active_neighbors:
-                try:
-                    send_msg(self.active_neighbors[target_id]["sock"], msg)
-                    return True
-                except Exception:
-                    return False
-        return False
-
-    def _listen_neighbor(self, peer_id: str, sock: socket.socket):
+    def _listen_to_peer(self, sock: socket.socket, peer_id: str):
+        """Loop de escuta dedicado para as mensagens do vizinho."""
         while self.running:
             try:
                 msg = recv_msg(sock)
                 if not msg:
                     break
 
-                m_type = msg.get("type")
+                with self.lock:
+                    if peer_id in self.active_neighbors:
+                        self.active_neighbors[peer_id]["last_seen"] = time.time()
 
-                if m_type == MSG_PING:
-                    send_msg(sock, {"type": MSG_PONG, "node_id": self.node_id})
-                    self._touch_neighbor(peer_id)
-
-                elif m_type == MSG_PONG:
-                    self._touch_neighbor(peer_id)
-
-                elif m_type == MSG_ROUTING_UPDATE:
-                    self._touch_neighbor(peer_id)
-                    routes = msg.get("routes", {})
-                    any_change = False
-                    for flow_id, cost in routes.items():
-                        if self.routing_table.update_route_from_neighbor(peer_id, flow_id, cost):
-                            any_change = True
-                    if any_change:
-                        self.broadcast_routing_update()
-
-                elif m_type == MSG_JOIN_STREAM:
-                    self._touch_neighbor(peer_id)
-                    flow_id = msg.get("flow_id")
-                    requester = msg.get("requester_id")
-                    need_upstream, parent = self.routing_table.add_child(flow_id, requester)
-
-                    send_msg(sock, {
-                        "type": MSG_JOIN_ACK,
-                        "flow_id": flow_id,
-                        "status": "ACCEPTED"
-                    })
-
-                    if need_upstream and parent:
-                        print(f"[{self.node_id}] A propagar JOIN de {flow_id} em direção a {parent}...")
-                        self._send_control_msg(parent, {
-                            "type": MSG_JOIN_STREAM,
-                            "flow_id": flow_id,
-                            "requester_id": self.node_id
-                        })
-
-                elif m_type == MSG_LEAVE_STREAM:
-                    self._touch_neighbor(peer_id)
-                    flow_id = msg.get("flow_id")
-                    requester = msg.get("requester_id")
-                    need_prune, parent = self.routing_table.remove_child(flow_id, requester)
-                    if need_prune and parent:
-                        self._send_control_msg(parent, {
-                            "type": MSG_LEAVE_STREAM,
-                            "flow_id": flow_id,
-                            "requester_id": self.node_id
-                        })
-
-                elif m_type == MSG_JOIN_ACK:
-                    self._touch_neighbor(peer_id)
-                    print(f"[{self.node_id}] JOIN_ACK recebido para {msg.get('flow_id')}!")
+                self._process_message(msg, peer_id, sock)
 
             except Exception:
                 break
 
-        self._remove_neighbor(peer_id)
+        self._unregister_neighbor(peer_id, sock)
 
-    def _touch_neighbor(self, peer_id: str):
+    def _process_message(self, msg: dict, peer_id: str, sock: socket.socket):
+        m_type = msg.get("type")
+
+        if m_type == MSG_PING:
+            send_msg(sock, {"type": MSG_PONG, "node_id": self.node_id})
+
+        elif m_type == MSG_PONG:
+            t_send = self.ping_timestamps.get(peer_id)
+            if t_send:
+                rtt = max(0.1, (time.time() - t_send) * 1000.0)  # RTT em ms
+                with self.lock:
+                    if peer_id in self.active_neighbors:
+                        self.active_neighbors[peer_id]["rtt"] = rtt
+
+        elif m_type == MSG_ROUTING_UPDATE:
+            routes = msg.get("routes", {})
+            changed = False
+            for fid, advertised_cost in routes.items():
+                # Custo acumulado (+1 salto ou RTT)
+                new_cost = advertised_cost + 1.0
+                if self.routing_table.update_route(fid, new_cost, peer_id):
+                    changed = True
+                    print(f"[{self.node_id}] [ROTA ATUALIZADA] Stream {fid} via {peer_id} (Custo: {new_cost:.1f})")
+
+            if changed:
+                self.broadcast_routing_updates()
+
+        elif m_type == MSG_JOIN_STREAM:
+            flow_id = msg.get("flow_id")
+            requester_id = msg.get("requester_id", peer_id)
+
+            needs_upstream_join, parent_id = self.routing_table.add_child_to_stream(flow_id, requester_id)
+            
+            with self.routing_table.lock:
+                total_children = len(self.routing_table.routes[flow_id].children) if flow_id in self.routing_table.routes else 0
+            
+            print(f"[{self.node_id}] [MULTICAST] Filho {requester_id} adicionado ao fluxo {flow_id}. Total filhos: {total_children}")
+
+            if needs_upstream_join and parent_id:
+                print(f"[{self.node_id}] A propagar JOIN de {flow_id} em direção a {parent_id}...")
+                self.send_to_neighbor(parent_id, {
+                    "type": MSG_JOIN_STREAM,
+                    "flow_id": flow_id,
+                    "requester_id": self.node_id
+                })
+            else:
+                print(f"[{self.node_id}] [GRAFTING] Tronco partilhado para {flow_id}. Ramo ativado sem novo pedido a montante.")
+
+            send_msg(sock, {"type": MSG_JOIN_ACK, "flow_id": flow_id})
+
+        elif m_type == MSG_LEAVE_STREAM:
+            flow_id = msg.get("flow_id")
+            requester_id = msg.get("requester_id", peer_id)
+
+            needs_prune, parent_id = self.routing_table.remove_child_from_stream(flow_id, requester_id)
+            
+            with self.routing_table.lock:
+                rem_children = len(self.routing_table.routes[flow_id].children) if flow_id in self.routing_table.routes else 0
+            
+            print(f"[{self.node_id}] [MULTICAST] Filho {requester_id} removido de {flow_id}. Restantes: {rem_children}")
+
+            if needs_prune and parent_id:
+                print(f"[{self.node_id}] [PRUNING] Sem mais filhos para {flow_id}. Ramo desativado. A propagar LEAVE a {parent_id}...")
+                self.send_to_neighbor(parent_id, {
+                    "type": MSG_LEAVE_STREAM,
+                    "flow_id": flow_id,
+                    "requester_id": self.node_id
+                })
+
+    def send_to_neighbor(self, peer_id: str, msg: dict) -> bool:
+        with self.lock:
+            peer_info = self.active_neighbors.get(peer_id)
+            if not peer_info:
+                return False
+            sock = peer_info["sock"]
+        return send_msg(sock, msg)
+
+    def _send_routing_update_to(self, peer_id: str):
+        routes = self.routing_table.get_exportable_routes()
+        self.send_to_neighbor(peer_id, {
+            "type": MSG_ROUTING_UPDATE,
+            "routes": routes
+        })
+
+    def broadcast_routing_updates(self):
+        routes = self.routing_table.get_exportable_routes()
+        with self.lock:
+            recipients = list(self.active_neighbors.values())
+
+        for peer in recipients:
+            try:
+                send_msg(peer["sock"], {
+                    "type": MSG_ROUTING_UPDATE,
+                    "routes": routes
+                })
+            except Exception:
+                pass
+
+    def _unregister_neighbor(self, peer_id: str, sock: socket.socket):
         with self.lock:
             if peer_id in self.active_neighbors:
-                self.active_neighbors[peer_id]["last_seen"] = time.time()
+                del self.active_neighbors[peer_id]
+            if sock in self.sockets_map:
+                del self.sockets_map[sock]
 
-    def _remove_neighbor(self, peer_id: str):
-        with self.lock:
-            if peer_id in self.active_neighbors:
-                info = self.active_neighbors.pop(peer_id)
-                try:
-                    info["sock"].close()
-                except Exception:
-                    pass
-                print(f"[{self.node_id}] Vizinho {peer_id} desconectado.")
+        try:
+            sock.close()
+        except Exception:
+            pass
 
-        affected = self.routing_table.handle_neighbor_down(peer_id)
-        if affected:
-            self.broadcast_routing_update()
+        print(f"[{self.node_id}] Vizinho {peer_id} desconectado.")
+        
+        # Trata podas imediatas caso o vizinho que caiu fosse filho ou pai de árvores
+        prune_actions = self.routing_table.remove_neighbor(peer_id)
+        for flow_id, (needs_prune, upstream_parent) in prune_actions.items():
+            if needs_prune and upstream_parent:
+                print(f"[{self.node_id}] [PRUNING] Nó {peer_id} caiu. Sem mais filhos para {flow_id}. A podar em {upstream_parent}...")
+                self.send_to_neighbor(upstream_parent, {
+                    "type": MSG_LEAVE_STREAM,
+                    "flow_id": flow_id,
+                    "requester_id": self.node_id
+                })
+
+        self.broadcast_routing_updates()
 
     def heartbeat_and_maintenance_loop(self):
-        last_route_broadcast = 0
+        """Loop periódico: mede RTT, remove nós mortos e mantém anúncios ativos."""
         while self.running:
             time.sleep(2.0)
             now = time.time()
-            to_remove = []
+            dead_peers = []
 
             with self.lock:
-                for peer_id, info in list(self.active_neighbors.items()):
-                    if now - info["last_seen"] > 6.0:
-                        to_remove.append(peer_id)
-                    else:
-                        try:
-                            send_msg(info["sock"], {"type": MSG_PING, "node_id": self.node_id})
-                        except Exception:
-                            to_remove.append(peer_id)
+                active_list = list(self.active_neighbors.items())
 
-            for peer_id in to_remove:
-                self._remove_neighbor(peer_id)
+            for pid, pdata in active_list:
+                # Se não responder há mais de 10 segundos, considera-se caído
+                if now - pdata["last_seen"] > 10.0:
+                    dead_peers.append((pid, pdata["sock"]))
+                    continue
 
-            with self.lock:
-                deficit = self.target_peers - len(self.active_neighbors)
-                available = list(self.known_contacts.items())
+                # Envio de PING com timestamp para medição do RTT
+                self.ping_timestamps[pid] = now
+                try:
+                    send_msg(pdata["sock"], {"type": MSG_PING})
+                except Exception:
+                    dead_peers.append((pid, pdata["sock"]))
 
-            if deficit > 0 and available:
-                for peer_id, (ip, port) in available:
-                    if len(self.active_neighbors) >= self.target_peers:
-                        break
-                    self.connect_to_peer(peer_id, ip, port)
+            for pid, sock in dead_peers:
+                self._unregister_neighbor(pid, sock)
 
-            if now - last_route_broadcast > 10.0:
-                self.broadcast_routing_update()
-                last_route_broadcast = now
+            # Anúncio periódico do catálogo/rotas
+            self.broadcast_routing_updates()
